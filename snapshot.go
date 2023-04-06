@@ -8,6 +8,8 @@
 package knoxite
 
 import (
+	"context"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -220,6 +222,122 @@ func (snapshot *Snapshot) Add(repository Repository, chunkIndex *ChunkIndex, opt
 			chunkIndex.AddArchive(archive, snapshot.ID)
 		}
 
+	}()
+
+	return progress
+}
+
+func (snapshot *Snapshot) AddWithContext(ctx context.Context, repository Repository, chunkIndex *ChunkIndex, opts StoreOptions) <-chan Progress {
+	progress := make(chan Progress)
+	ch := snapshot.gatherTargetInformation(opts.CWD, opts.Paths, opts.Excludes)
+
+	go func() {
+		defer close(progress)
+
+		for result := range ch {
+			if ctx.Err() != nil {
+				// context has been cancelled, exit
+				fmt.Println("Aborting...")
+				return
+			}
+
+			select {
+			case <-ctx.Done():
+				fmt.Println("Context done!")
+				// context has been cancelled, exit
+				return
+			default:
+				if result.Error != nil {
+					p := newProgressError(result.Error)
+					p.Path = result.Archive.Path
+					progress <- p
+					if opts.Pedantic {
+						break
+					}
+					continue
+				}
+
+				archive := result.Archive
+				rel, err := filepath.Rel(opts.CWD, archive.Path)
+				if err == nil && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+					archive.Path = rel
+				}
+				if isSpecialPath(archive.Path) {
+					continue
+				}
+
+				p := newProgress(archive)
+				snapshot.mut.Lock()
+				p.TotalStatistics = snapshot.Stats
+				snapshot.mut.Unlock()
+				progress <- p
+
+				if archive.Type == File {
+					opts.DataParts = uint(math.Max(1, float64(opts.DataParts)))
+					chunkchan, err := chunkFile(archive.Path, repository.Key, opts)
+					if err != nil {
+						if os.IsNotExist(err) {
+							// if this file has already been deleted before we could backup it, we can gracefully ignore it and continue
+							continue
+						}
+						p = newProgressError(err)
+						p.Path = archive.Path
+						progress <- p
+						if opts.Pedantic {
+							break
+						}
+						continue
+					}
+					archive.Encrypted = opts.Encrypt
+					archive.Compressed = opts.Compress
+
+					for cd := range chunkchan {
+						if cd.Error != nil {
+							p = newProgressError(err)
+							p.Path = archive.Path
+							progress <- p
+							if opts.Pedantic {
+								return
+							}
+							continue
+						}
+						chunk := cd.Chunk
+						// fmt.Printf("\tSplit %s (#%d, %d bytes), compression: %s, encryption: %s, hash: %s\n", id.Path, cd.Num, cd.Size, CompressionText(cd.Compressed), EncryptionText(cd.Encrypted), cd.Hash)
+
+						// store this chunk
+						n, err := repository.backend.StoreChunk(chunk)
+						if err != nil {
+							p = newProgressError(err)
+							p.Path = archive.Path
+							progress <- p
+							if opts.Pedantic {
+								return
+							}
+							continue
+						}
+
+						// release the memory, we don't need the data anymore
+						chunk.Data = &[][]byte{}
+
+						archive.Chunks = append(archive.Chunks, chunk)
+						archive.StorageSize += n
+
+						p.CurrentItemStats.StorageSize = archive.StorageSize
+						p.CurrentItemStats.Transferred += uint64(chunk.OriginalSize)
+						snapshot.Stats.Transferred += uint64(chunk.OriginalSize)
+						snapshot.Stats.StorageSize += n
+
+						snapshot.mut.Lock()
+						p.TotalStatistics = snapshot.Stats
+						snapshot.mut.Unlock()
+						progress <- p
+					}
+				}
+
+				snapshot.AddArchive(archive)
+				chunkIndex.AddArchive(archive, snapshot.ID)
+			}
+		}
 	}()
 
 	return progress
